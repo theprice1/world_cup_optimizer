@@ -1,5 +1,21 @@
 import pandas as pd
 
+def clean_position(pos_val):
+    """
+    Standardizes any variations of position strings into strict 
+    GK, DEF, MID, FWD tokens.
+    """
+    p = str(pos_val).upper().strip()
+    if p in ['GK', 'GOALKEEPER', 'G']:
+        return 'GK'
+    if p in ['DEF', 'DF', 'DEFENDER', 'D']:
+        return 'DEF'
+    if p in ['MID', 'MD', 'MIDFIELDER', 'M']:
+        return 'MID'
+    if p in ['FWD', 'FW', 'FORWARD', 'ATTACKER', 'STRIKER', 'F']:
+        return 'FWD'
+    return p
+
 def calculate_projections(df, match_odds):
     """
     Takes a raw FanTeam dataframe and calculates individualized xPts 
@@ -12,7 +28,8 @@ def calculate_projections(df, match_odds):
         if isinstance(team, str):
             team = team.strip().upper()
             
-        pos = str(row['Position']).upper().strip()
+        # Dynamically normalize position formatting issues
+        pos = clean_position(row['Position'])
         name = row['Name']
 
         if team not in match_odds:
@@ -61,6 +78,7 @@ def calculate_projections(df, match_odds):
         base_pts += ((odds['Win_prob'] * 0.3) - (odds['Loss_prob'] * 0.3))
         
         row_dict = row.to_dict()
+        row_dict['Position'] = pos  # Reassign clean position string to dataframe output
         row_dict['xPts'] = round(base_pts, 2)
         projected_data.append(row_dict)
 
