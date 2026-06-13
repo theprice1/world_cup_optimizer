@@ -1,7 +1,35 @@
 import pandas as pd
 import numpy as np
+import requests
 import math
 
+# ==========================================
+# PHASE 1: LIVE API ODDS INGESTION
+# ==========================================
+def fetch_live_market_odds(api_key, sport="soccer_fifa_world_cup", regions="eu"):
+    """
+    Dynamically pulls live moneyline and over/under odds from The-Odds-API.
+    Falls back to safe default tournament projections if the API limits are hit.
+    """
+    url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds/"
+    params = {
+        "apiKey": api_key,
+        "regions": regions,
+        "markets": "h2h,totals",
+        "oddsFormat": "decimal"
+    }
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        pass
+    return None # Pipeline will handle None by reverting to default UI state safely
+
+
+# ==========================================
+# PHASE 2 & 3: HISTORICAL SHARES & BOTTLENECK ADJUSTMENTS
+# ==========================================
 def clean_position(pos_val):
     p = str(pos_val).upper().strip()
     if p in ['GK', 'GOALKEEPER', 'G']: return 'GK'
@@ -10,163 +38,163 @@ def clean_position(pos_val):
     if p in ['FWD', 'FW', 'FORWARD', 'ATTACKER', 'STRIKER', 'F']: return 'FWD'
     return p
 
-def clean_tactical_role(role_val):
-    r = str(role_val).upper().strip()
-    if r in ['NAILED', 'STARTER', '90', 'FULL']: return 'NAILED'
-    if r in ['VOLATILE', 'RISK', 'SUB_RISK', '60']: return 'VOLATILE'
-    if r in ['SUB', 'IMPACT', 'BENCH', '25']: return 'IMPACT'
-    return 'NAILED'  # Default safely to Nailed if column doesn't exist
-
-def calculate_poisson_clean_sheet_decay(expected_conceded):
+def compile_base_probabilities(df, match_odds):
     """
-    Uses a Poisson distribution to calculate exact probabilities for goals conceded
-    to accurately score format-specific clean sheets and defensive penalties.
-    """
-    lam = max(0.05, expected_conceded)
-    
-    p0 = math.exp(-lam)                  # Concede 0 (Clean Sheet)
-    p1 = (lam ** 1) * math.exp(-lam) / 1  # Concede 1
-    p2 = (lam ** 2) * math.exp(-lam) / 2  # Concede 2
-    p3 = (lam ** 3) * math.exp(-lam) / 6  # Concede 3
-    p4_plus = max(0.0, 1.0 - (p0 + p1 + p2 + p3)) # Concede 4+
-    
-    # Expected FanTeam scoring impact: +4 for clean sheet, -1 for every 2 goals conceded after the first
-    # Concede 0 = +4.0 pts
-    # Concede 1 = 0.0 pts
-    # Concede 2 = -1.0 pts
-    # Concede 3 = -1.0 pts
-    # Concede 4+ = -2.0 pts (approx baseline)
-    expected_defensive_scoring = (p0 * 4.0) + (p1 * 0.0) + (p2 * -1.0) + (p3 * -1.0) + (p4_plus * -2.0)
-    
-    return p0, expected_defensive_scoring
-
-def calculate_projections(df, match_odds):
-    """
-    Advanced Tier-4 Projection Engine featuring:
-    - xMin Runtime Modeling
-    - Anytime Market Decoupling
-    - Poisson Conceded Goal Penalties
-    - Positional Tactical Scaling
+    Combines historical rolling player xG/xA per 90 with opponent 
+    positional defensive vulnerabilities.
     """
     df = df.copy()
     df['Position'] = df['Position'].apply(clean_position)
-    df['Price'] = pd.to_numeric(df['Price'], errors='coerce').fillna(4.5)
     
+    # Use real historical statistics if present; otherwise fallback gracefully to scaled prices
+    if 'Hist_xG_per90' not in df.columns: df['Hist_xG_per90'] = pd.to_numeric(df['Price'], errors='coerce').fillna(4.5) * 0.02
+    if 'Hist_xA_per90' not in df.columns: df['Hist_xA_per90'] = pd.to_numeric(df['Price'], errors='coerce').fillna(4.5) * 0.015
+    if 'Hist_xMin' not in df.columns: df['Hist_xMin'] = 75.0
+
     team_col = 'Club' if 'Club' in df.columns else 'Team'
     df['Normalized_Team'] = df[team_col].astype(str).str.strip().str.upper()
-    
-    # Safely look for advanced columns, use intelligent statistical defaults if missing
-    if 'Tactical_Role' not in df.columns:
-        df['Tactical_Role'] = 'NAILED'
-    df['Tactical_Role'] = df['Tactical_Role'].apply(clean_tactical_role)
-    
-    if 'Attacking_Tier' not in df.columns:
-        # Default Fullbacks/Wingers higher, Center Backs lower if info missing
-        df['Attacking_Tier'] = 2
-    df['Attacking_Tier'] = pd.to_numeric(df['Attacking_Tier'], errors='coerce').fillna(2).astype(int)
 
-    # Calculate Market Override values if provided
-    df['Market_Scorer_Prob'] = 0.0
-    if 'Anytime_Scorer_Odds' in df.columns:
-        # Converts e.g., 2.50 decimal odds to 0.40 probability. Assumes decimals.
-        df['Market_Scorer_Prob'] = 1.0 / pd.to_numeric(df['Anytime_Scorer_Odds'], errors='coerce').fillna(float('inf'))
-        df['Market_Scorer_Prob'] = df['Market_Scorer_Prob'].fillna(0.0)
+    # Opponent defensive bottleneck vectors (e.g., Team X concedes heavily down the flanks)
+    # Default = 1.0 (neutral). A value of 1.25 means the opponent allows 25% more production to that position.
+    opp_vulnerability = {
+        'QAT': {'DEF': 1.25, 'MID': 1.10, 'FWD': 1.05, 'GK': 1.0},
+        'SUI': {'DEF': 0.85, 'MID': 0.90, 'FWD': 0.80, 'GK': 0.95}
+    }
 
-    # Step 1: Pre-calculate positional price pools to allocate unassigned xG/xA
-    group_salaries = df.groupby(['Normalized_Team', 'Position'])['Price'].sum().to_dict()
+    # Calculate squad-level aggregate historical expected stats to build market distribution weights
+    team_totals = df.groupby('Normalized_Team')[['Hist_xG_per90', 'Hist_xA_per90']].sum().to_dict('index')
 
-    projected_data = []
+    player_profiles = []
 
     for index, row in df.iterrows():
         team = row['Normalized_Team']
         pos = row['Position']
-        price = row['Price']
-        role = row['Tactical_Role']
-        tier = row['Attacking_Tier']
-        market_xg = row['Market_Scorer_Prob']
-
+        
         if team not in match_odds:
-            row_dict = row.to_dict()
-            row_dict['xPts'] = 0.0
-            projected_data.append(row_dict)
             continue
-
-        odds = match_odds[team]
-        opp_team = [t for t in match_odds.keys() if t != team]
-        opp_xG = match_odds[opp_team[0]]['xG'] if opp_team else 1.0
-
-        # --- 1. EXPECTED MINUTES MODELING ---
-        xMin = {'NAILED': 90.0, 'VOLATILE': 62.0, 'IMPACT': 25.0}.get(role, 90.0)
-        min_factor = xMin / 90.0
+            
+        opp = [t for t in match_odds.keys() if t != team][0]
+        vuln_factor = opp_vulnerability.get(opp, {}).get(pos, 1.0)
         
-        # Base Appearance Points
-        base_pts = 0.0
-        if xMin >= 60.0:
-            base_pts += 2.0  # Played 60+ mins
-        elif xMin > 0.0:
-            base_pts += 1.0  # Played under 60 mins
-
-        # Clean Sheet Eligibility Modifier
-        cs_eligibility = 1.0 if xMin >= 60.0 else 0.0
-
-        # --- 2. POISSON CLEAN SHEET DECAY ---
-        # Find true defensive equity using actual probability distributions
-        true_cs_prob, net_defensive_points = calculate_poisson_clean_sheet_decay(opp_xG)
+        # Calculate raw team share weights based on historical baseline records
+        t_totals = team_totals.get(team, {'Hist_xG_per90': 1.0, 'Hist_xA_per90': 1.0})
+        xg_share = (row['Hist_xG_per90'] / max(0.01, t_totals['Hist_xG_per90'])) * vuln_factor
+        xa_share = (row['Hist_xA_per90'] / max(0.01, t_totals['Hist_xA_per90'])) * vuln_factor
         
-        if pos in ['GK', 'DEF'] and cs_eligibility > 0:
-            base_pts += net_defensive_points
-        elif pos == 'MID' and cs_eligibility > 0:
-            base_pts += (true_cs_prob * 1.0) # Midfielders get 1 pt for clean sheets, no negative scaling
-
-        # --- 3. MARKET SCORER AND ATTACKING TIER INTELLIGENCE ---
-        # Calculate individual shares
-        total_pos_salary = group_salaries.get((team, pos), price)
-        price_weight = (price / total_pos_salary) if total_pos_salary > 0 else 1.0
+        player_profiles.append({
+            'Name': row['Name'],
+            'Team': team,
+            'Position': pos,
+            'Price': row['Price'],
+            'xMin': float(row['Hist_xMin']),
+            'Base_xG_Share': xg_share,
+            'Base_xA_Share': xa_share
+        })
         
-        # Modify price weight by tactical attacking tier profile
-        # Tier 1 = Heavy attacking wingback/creative engine, Tier 3 = Defensive anchor
-        tier_multiplier = {1: 1.5, 2: 1.0, 3: 0.5}.get(tier, 1.0)
-        effective_weight = price_weight * tier_multiplier
+    return player_profiles
 
-        # Distribute Team xG
-        if market_xg > 0:
-            # Absolute override using raw bookmaker intelligence
-            player_xG = market_xg * min_factor
-        else:
-            # Proportional modeling using modified tactical price distributions
-            pos_xG_share = {'FWD': 0.45, 'MID': 0.35, 'DEF': 0.18, 'GK': 0.02}.get(pos, 0)
-            player_xG = odds['xG'] * pos_xG_share * effective_weight * 2.0 * min_factor
 
-        player_xA = player_xG * 0.75 * tier_multiplier # Scaled by creative profile
-
-        # Apply scoring framework metrics
-        goal_pts = {'FWD': 4, 'MID': 5, 'DEF': 6, 'GK': 10}.get(pos, 0)
-        base_pts += (player_xG * goal_pts)
-        base_pts += (player_xA * 3.0)
-
-        # --- 4. ADVANCED SHOTS ON TARGET & SAVES ---
-        pos_sot_share = {'FWD': 0.50, 'MID': 0.35, 'DEF': 0.15, 'GK': 0.0}.get(pos, 0)
-        player_xSoT = odds['Team_xSoT'] * pos_sot_share * effective_weight * 2.0 * min_factor
-        sot_multiplier = {'FWD': 0.4, 'MID': 0.4, 'DEF': 0.6, 'GK': 0.0}.get(pos, 0)
-        base_pts += (player_xSoT * sot_multiplier)
-
-        # Goalkeeper Saves Math (Calculates save volume from opponent raw shots on target)
-        if pos == 'GK':
-            xSaves = max(0.0, odds['Opp_xSoT'] - opp_xG) * min_factor
-            base_pts += (xSaves * 0.5)
-
-        # Team Impact bonus points (Winner/Loser bonuses scaled by game length)
-        base_pts += (((odds['Win_prob'] * 0.3) - (odds['Loss_prob'] * 0.3)) * min_factor)
+# ==========================================
+# PHASE 4: MONTE CARLO SIMULATION ENGINE
+# ==========================================
+def run_monte_carlo_simulation(player_profiles, match_odds, simulations=10000, target_percentile=90):
+    """
+    Simulates the entire match script 10,000 times using paired Poisson distributions.
+    Extracts the elite 'ceiling' outcome profiles to build tournament winning lineups.
+    """
+    teams = list(match_odds.keys())
+    team_a, team_b = teams[0], teams[1]
+    
+    # Arrays to collect simulation outputs across all runs
+    sim_results = {p['Name']: np.zeros(simulations) for p in player_profiles}
+    
+    for sim in range(simulations):
+        # 1. Generate random true game script goal tallies via Poisson distributions
+        goals_a = np.random.poisson(match_odds[team_a]['xG'])
+        goals_b = np.random.poisson(match_odds[team_b]['xG'])
         
-        row_dict = row.to_dict()
-        row_dict['xPts'] = round(max(0.0, base_pts), 2)
-        projected_data.append(row_dict)
+        # Determine match state outcome
+        cs_a = (goals_b == 0)
+        cs_b = (goals_a == 0)
+        
+        # 2. Iterate through players and score individual match events dynamically
+        for p in player_profiles:
+            pts = 0.0
+            xMin_factor = p['xMin'] / 90.0
+            
+            # Appearance allocation logic
+            if p['xMin'] >= 60: pts += 2.0
+            elif p['xMin'] > 0: pts += 1.0
+            else: continue
+            
+            # Team specific context matching
+            is_team_a = (p['Team'] == team_a)
+            my_team_goals = goals_a if is_team_a else goals_b
+            opp_team_goals = goals_b if is_team_a else goals_a
+            has_cs = cs_a if is_team_a else cs_b
+            
+            # Match outcome bonus vectors
+            if my_team_goals > opp_team_goals: pts += (0.3 * xMin_factor)
+            elif my_team_goals < opp_team_goals: pts -= (0.3 * xMin_factor)
+            
+            # Clean Sheet scoring maps
+            if has_cs and p['xMin'] >= 60:
+                if p['Position'] in ['GK', 'DEF']: pts += 4.0
+                elif p['Position'] == 'MID': pts += 1.0
+            elif p['Position'] in ['GK', 'DEF'] and p['xMin'] >= 60:
+                # Goal conceding penalties (-1 for every 2 goals conceded after the first)
+                if opp_team_goals >= 2:
+                    pts -= math.floor(opp_team_goals / 2)
 
-    projected_df = pd.DataFrame(projected_data)
-    if 'Normalized_Team' in projected_df.columns:
-        projected_df = projected_df.drop(columns=['Normalized_Team'])
+            # 3. Simulate Event Multipliers (Goals and Assists)
+            if my_team_goals > 0:
+                # Probability scaling factor for individual distribution assignments
+                sim_goals = np.random.binomial(my_team_goals, min(1.0, p['Base_xG_Share'] * xMin_factor))
+                sim_assists = np.random.binomial(max(0, my_team_goals - sim_goals), min(1.0, p['Base_xA_Share'] * xMin_factor))
+                
+                goal_value = {'FWD': 4, 'MID': 5, 'DEF': 6, 'GK': 10}.get(p['Position'], 4)
+                pts += (sim_goals * goal_value)
+                pts += (sim_assists * 3.0)
+                
+            # Peripheral volume projections (Shots on Target / Saves)
+            team_sot = match_odds[p['Team']]['Team_xSoT']
+            sim_sot = np.random.binomial(np.random.poisson(team_sot), min(0.3, 0.05 * xMin_factor))
+            sot_val = {'FWD': 0.4, 'MID': 0.4, 'DEF': 0.6}.get(p['Position'], 0.0)
+            pts += (sim_sot * sot_val)
+            
+            if p['Position'] == 'GK':
+                opp_sot = match_odds[team_b if is_team_a else team_a]['Team_xSoT']
+                sim_saves = max(0, np.random.poisson(opp_sot) - my_team_goals)
+                pts += (sim_saves * 0.5)
+
+            sim_results[p['Name']][sim] = max(0.0, pts)
+            
+    # 4. Collapse all 10,000 array iterations down into the specified percentile projection
+    compiled_projections = []
+    for p in player_profiles:
+        percentile_score = np.percentile(sim_results[p['Name']], target_percentile)
+        compiled_projections.append({
+            'Name': p['Name'],
+            'Team': p['Team'],
+            'Position': p['Position'],
+            'Price': p['Price'],
+            'xPts': round(percentile_score, 2)
+        })
         
-    if 'xPts' in projected_df.columns:
-        projected_df = projected_df.sort_values(by='xPts', ascending=False)
-        
-    return projected_df
+    return pd.DataFrame(compiled_projections).sort_values(by='xPts', ascending=False)
+
+# ==========================================
+# MASTER RUNTIME INTEGRATION ENTRY POINT
+# ==========================================
+def calculate_projections(df, match_odds):
+    """
+    Main pipeline handler mapping clean historical frameworks 
+    and feeding the Monte Carlo simulation logic.
+    """
+    # 1. Build and clean historical profiles
+    profiles = compile_base_probabilities(df, match_odds)
+    
+    # 2. Run simulation tracking elite 90th-percentile tournament upside floors
+    final_projections_df = run_monte_carlo_simulation(profiles, match_odds, simulations=10000, target_percentile=90)
+    
+    return final_projections_df
