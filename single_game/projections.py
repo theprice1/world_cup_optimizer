@@ -32,17 +32,27 @@ class ProjectionEngine:
         
         rows = []
         
-        # Loop through the actual players in your uploaded FanTeam CSV
         for index, row in fanteam_df.iterrows():
-            # Extract standard FanTeam CSV fields
-            raw_name = row.get('name', row.get('Player', 'Unknown'))
-            position = row.get('position', row.get('Position', 'MID'))
-            salary = row.get('price', row.get('Price', 8.0))
-            team = row.get('team', row.get('Team', 'Unknown'))
+            # 1. Aggressive Name & Team Catching (Checks multiple common header variations)
+            raw_name = row.get('name', row.get('Name', row.get('player', row.get('Player', 'Unknown'))))
+            team = row.get('team', row.get('Team', row.get('club', 'Unknown')))
+            salary = row.get('price', row.get('Price', row.get('salary', 8.0)))
+            
+            # 2. Position Normalization ('goalkeeper' -> 'GK')
+            raw_pos = str(row.get('position', row.get('Position', 'MID'))).lower().strip()
+            if 'goal' in raw_pos or raw_pos == 'gk':
+                position = 'GK'
+            elif 'def' in raw_pos:
+                position = 'DEF'
+            elif 'mid' in raw_pos:
+                position = 'MID'
+            elif 'forw' in raw_pos or 'att' in raw_pos or raw_pos == 'fwd' or raw_pos == 'str':
+                position = 'FWD'
+            else:
+                position = 'MID'
             
             norm_name = pipeline_utils.normalize_name(raw_name)
             
-            # See if we have live odds or historical baselines for this player
             prop_data = live_props_map.get(norm_name, {})
             profile = baselines.get(raw_name, {'Starts': 5, 'Save_Pct': 0.65})
             
