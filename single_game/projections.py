@@ -23,7 +23,10 @@ class ProjectionEngine:
             return 0.0
         return 1.0 / decimal_odds
 
-def build_projections_dataframe(self, fanteam_df, baselines, live_props_map):
+    def build_projections_dataframe(self, fanteam_df, baselines, live_props_map):
+        """
+        Merges uploaded CSV data, baseline stats, and real-time market data vectors.
+        """
         from single_game.data_pipeline import LiveDataPipeline
         pipeline_utils = LiveDataPipeline()
         
@@ -31,7 +34,7 @@ def build_projections_dataframe(self, fanteam_df, baselines, live_props_map):
         
         # Loop through the actual players in your uploaded FanTeam CSV
         for index, row in fanteam_df.iterrows():
-            # Adjust these column names based on FanTeam's exact CSV headers (e.g., 'name', 'price', 'position')
+            # Extract standard FanTeam CSV fields
             raw_name = row.get('name', row.get('Player', 'Unknown'))
             position = row.get('position', row.get('Position', 'MID'))
             salary = row.get('price', row.get('Price', 8.0))
