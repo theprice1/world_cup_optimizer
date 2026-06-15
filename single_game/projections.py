@@ -50,24 +50,20 @@ class ProjectionEngine:
             # 2. Shots on Target Evaluation via Implied Odds Probabilities
             if sot_odds:
                 prob_over_sot = self.odds_to_probability(sot_odds)
-                # Mathematical estimation: weighted average of clearing the prop line
                 estimated_sot = sot_line * prob_over_sot * 1.2 
                 xPts += estimated_sot * self.scoring['shots_on_target']
             else:
-                # Historical baseline fallback
                 estimated_sot = 1.1 if position in ['FWD', 'MID'] else 0.2
                 xPts += estimated_sot * self.scoring['shots_on_target']
                 
             # 3. Position-Based Bonus Metrics (Saves/Clean Sheets)
             if position == 'GK':
-                # Simplified save calculation based on historical save percentage baseline
                 xPts += (profile['Starts'] * profile['Save_Pct'] * 0.3) * self.scoring['save']
-                # Default 30% baseline chance for a clean sheet if H2H endpoints are excluded
                 xPts += 0.30 * self.scoring['clean_sheet']
             elif position == 'DEF':
                 xPts += 0.30 * self.scoring['clean_sheet']
 
-            # Assign fantasy pricing configuration (simulating platform salary metrics)
+            # Assign fantasy pricing configuration
             mock_salaries = {'FWD': 11.5, 'MID': 9.5, 'DEF': 7.0, 'GK': 6.0}
             salary = mock_salaries.get(position, 8.0)
 
