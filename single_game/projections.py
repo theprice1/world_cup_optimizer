@@ -25,7 +25,8 @@ class ProjectionEngine:
 
     def build_projections_dataframe(self, fanteam_df, baselines, live_props_map):
         """
-        Merges uploaded CSV data, baseline stats, and real-time market data vectors.
+        Merges uploaded CSV data using exact FanTeam header matching
+        [['Tournament', 'PlayerID', 'Name', 'FName', 'Club', 'Lineup', 'Position', 'Price']]
         """
         from single_game.data_pipeline import LiveDataPipeline
         pipeline_utils = LiveDataPipeline()
@@ -33,13 +34,27 @@ class ProjectionEngine:
         rows = []
         
         for index, row in fanteam_df.iterrows():
-            # 1. Aggressive Name & Team Catching (Checks multiple common header variations)
-            raw_name = row.get('name', row.get('Name', row.get('player', row.get('Player', 'Unknown'))))
-            team = row.get('team', row.get('Team', row.get('club', 'Unknown')))
-            salary = row.get('price', row.get('Price', row.get('salary', 8.0)))
-            
-            # 2. Position Normalization ('goalkeeper' -> 'GK')
-            raw_pos = str(row.get('position', row.get('Position', 'MID'))).lower().strip()
+            # 1. Exact Column Mapping (Using the rigid headers found)
+            try:
+                # Case-sensitive exact matching for reliable mapping
+                raw_name = row['Name']  
+                team = row['Club']
+                salary_val = row['Price']
+                raw_pos_str = row['Position']
+            except KeyError as e:
+                # If FanTeam changes their format again, this gives us a specific debug error
+                raise KeyError(f"CRITICAL DATA MAP ERROR: Could not find required column {e} in FanTeam CSV download.")
+
+            # Ensure salary is a float (it may come in with M or Currency symbols)
+            if isinstance(salary_val, str):
+                import re
+                numeric_val_str = re.sub(r'[^\d.]', '', salary_val)
+                salary = float(numeric_val_str) if numeric_val_str else 0.0
+            else:
+                salary = float(salary_val)
+
+            # 2. Rigid Position Normalization ('goalkeeper' -> 'GK')
+            raw_pos = str(raw_pos_str).lower().strip()
             if 'goal' in raw_pos or raw_pos == 'gk':
                 position = 'GK'
             elif 'def' in raw_pos:
@@ -49,10 +64,12 @@ class ProjectionEngine:
             elif 'forw' in raw_pos or 'att' in raw_pos or raw_pos == 'fwd' or raw_pos == 'str':
                 position = 'FWD'
             else:
+                # Safely default edge cases to midfielder for appearance points
                 position = 'MID'
             
             norm_name = pipeline_utils.normalize_name(raw_name)
             
+            # 3. Apply live props or baselines
             prop_data = live_props_map.get(norm_name, {})
             profile = baselines.get(raw_name, {'Starts': 5, 'Save_Pct': 0.65})
             
@@ -61,25 +78,32 @@ class ProjectionEngine:
             
             xPts = self.scoring['appearance']
             
+            # --- Live Prop Calculation path ---
             if sot_odds:
                 prob_over_sot = self.odds_to_probability(sot_odds)
                 estimated_sot = sot_line * prob_over_sot * 1.2 
                 xPts += estimated_sot * self.scoring['shots_on_target']
+            # --- Historical Baseline path (Graceful degradation) ---
             else:
+                # Position-weighted fallback estimation
                 estimated_sot = 1.1 if position in ['FWD', 'MID'] else 0.2
                 xPts += estimated_sot * self.scoring['shots_on_target']
                 
+            # 4. Position-Specific Multipliers (FanTeam Scoring Rules)
             if position == 'GK':
-                xPts += (profile.get('Starts', 0) * profile.get('Save_Pct', 0) * 0.3) * self.scoring['save']
+                # Simplified save calculation based on starts
+                xPts += (profile.get('Starts', 0) * profile.get('Save_Pct', 0.65) * 0.3) * self.scoring['save']
+                # Default 30% standard baseline CS probability fallback
                 xPts += 0.30 * self.scoring['clean_sheet']
             elif position == 'DEF':
                 xPts += 0.30 * self.scoring['clean_sheet']
 
+            # 5. Compile the solved player vector
             rows.append({
                 'Player': raw_name,
                 'Team': team,
                 'Position': position,
-                'Salary': float(salary),
+                'Salary': salary,
                 'Projected_xPts': round(xPts, 2),
                 'Live_Market_Mapped': 'Yes' if sot_odds else 'No'
             })
