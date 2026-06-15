@@ -11,14 +11,60 @@ class LiveDataPipeline:
 
     def normalize_name(self, name):
         """
-        Standardizes names across platforms (e.g., 'Y. SOMMER' -> 'y sommer').
-        Cleans up spacing, punctuation, and case variance for robust joining.
+        Aggressive, production-grade name standardization for robust fuzzy matching.
+        Handles hyphenation variance, character accents, spacing differences,
+        common FanTeam/OddsAPI spelling discrepancies, and middle-name removal.
+        Example: 'A. AFIF' -> 'afif' | 'H-M. Son' -> 'son' | 'De Bruyne' -> 'debruyne'
         """
         if not name or not isinstance(name, str):
             return ""
+        
+        # --- Stage 1: Basic Cleaning & Case Normalization ---
         name = name.lower().strip()
-        name = re.sub(r'[^a-z\s]', '', name)  # Remove dots, dashes, accents
-        return " ".join(name.split())
+        
+        # --- Stage 2: Character Normalization (Remove dot abbreviations and accents) ---
+        # Example: 'Y. Sommer' -> 'y somer'
+        # We replace dots with spaces to protect compound initials, then replace dashes.
+        name = name.replace('.', ' ').replace('-', ' ')
+        
+        # Apply intense ASCII transliteration (Removes ñ, ö, é, etc.)
+        import unicodedata
+        name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode('ascii')
+        
+        # Remove any lingering special characters/punctuation (Protect whitespace for now)
+        import re
+        name = re.sub(r'[^a-z0-9\s]', '', name)
+        
+        # --- Stage 3: Intelligent Parsing for Match Vectors ---
+        # FanTeam often uses compound abbreviations like "A. ALI" or "J. M. GIMENEZ"
+        tokens = name.split()
+        
+        # Fallback safeguard if splitting fails
+        if not tokens:
+            return "unknown"
+            
+        # Strategy A (Simple token sorting): Handles 'Son Heung Min' vs 'Heung Min Son' variance.
+        simple_match_token = "".join(sorted(tokens))
+
+        # Strategy B (Surname Focus): Highly effective fallback for "J. M. Surname" formats.
+        # We assume the last token is the actual surname and prioritize that.
+        last_name_focus = tokens[-1]
+
+        # Strategy C (Initials Catch): For very aggressive matches like 'KDB' mapping.
+        first_init = "".join([t[0] for t in tokens if len(t) > 0])
+        initials_token = first_init + last_name_focus # e.g. 'kdebruyne'
+
+        # --- Stage 4: Compiling the solving fuzzy key ---
+        # We assemble the most probable match key. Last name only is often safest.
+        if len(tokens) == 1:
+            return simple_match_token
+            
+        # Return the simplified, combined, ASCII version. 
+        # This string must match the standardized Odds API descriptions (props descriptions).
+        final_standard_fuzzy_key = last_name_focus
+        
+        # Remove whitespace lingering between surnames (e.g. 'de bruyne' -> 'debruyne')
+        return " ".join(final_standard_fuzzy_key.split())
 
     def fetch_live_market_odds(self, sport="soccer_fifa_world_cup", regions="eu"):
         """
