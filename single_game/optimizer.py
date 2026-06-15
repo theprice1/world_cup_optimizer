@@ -1,68 +1,64 @@
 import pulp
 import pandas as pd
 
-def run_optimization(df, budget=59.0, num_lineups=10, max_overlap=4, stack_rule=None):
-    all_lineups = []
-    previous_lineups = [] 
-    players = df.index.tolist()
-    team_col = 'Club' if 'Club' in df.columns else 'Team'
-    
-    for lineup_num in range(1, num_lineups + 1):
-        prob = pulp.LpProblem(f"Lineup_{lineup_num}", pulp.LpMaximize)
-        
-        roster_vars = pulp.LpVariable.dicts("roster", players, 0, 1, pulp.LpBinary)
-        captain_vars = pulp.LpVariable.dicts("captain", players, 0, 1, pulp.LpBinary)
-        
-        # Objective Function
-        prob += pulp.lpSum(
-            (df.loc[i, 'xPts'] * roster_vars[i]) + 
-            (df.loc[i, 'xPts'] * 0.5 * captain_vars[i]) 
-            for i in players
+class LineupOptimizer:
+    def __init__(self, player_df):
+        """
+        Initializes the optimizer with the parsed player pool DataFrame.
+        """
+        self.df = player_df.copy()
+        # Ensure data types are correct for the mathematical solver
+        self.df['Salary'] = self.df['Salary'].astype(float)
+        self.df['Projected_xPts'] = self.df['Projected_xPts'].astype(float)
+
+    def solve_optimal_lineup(self, budget=50.0, max_per_team=3, roster_size=5):
+        """
+        Solves a Mixed-Integer Linear Programming (MILP) problem to find 
+        the optimal combination of players maximizing Projected_xPts.
+        """
+        if self.df.empty:
+            return None
+
+        # 1. Define the Problem
+        prob = pulp.LpProblem("FanTeam_Single_Game_Optimization", pulp.LpMaximize)
+
+        # 2. Define Decision Variables (1 if player is picked, 0 otherwise)
+        player_vars = pulp.LpVariable.dicts(
+            "Player", 
+            self.df.index, 
+            cat=pulp.LpBinary
         )
-        
-        # Base Lineup Composition
-        prob += pulp.lpSum(roster_vars[i] for i in players) == 5
-        prob += pulp.lpSum(captain_vars[i] for i in players) == 1
-        
-        for i in players:
-            prob += captain_vars[i] <= roster_vars[i]
-            
-        prob += pulp.lpSum(df.loc[i, 'Price'] * roster_vars[i] for i in players) <= budget
-        
-        gk_indices = df[df['Position'] == 'GK'].index.tolist()
-        prob += pulp.lpSum(roster_vars[i] for i in gk_indices) <= 1
 
-        # Stacking Rules
-        if stack_rule:
-            for team, required_count in stack_rule.items():
-                team_indices = df[df[team_col].str.upper() == team.upper()].index.tolist()
-                prob += pulp.lpSum(roster_vars[i] for i in team_indices) == required_count
-        else:
-            teams = df[team_col].unique()
-            for team in teams:
-                team_indices = df[df[team_col] == team].index.tolist()
-                prob += pulp.lpSum(roster_vars[i] for i in team_indices) <= 3
+        # 3. Objective Function: Maximize Expected Points
+        prob += pulp.lpSum(self.df.loc[i, 'Projected_xPts'] * player_vars[i] for i in self.df.index)
 
-        # Lineup Diversity Constraints
-        for past_lineup in previous_lineups:
-            prob += pulp.lpSum(roster_vars[i] for i in past_lineup) <= max_overlap
+        # 4. Constraint 1: Total Roster Size
+        prob += pulp.lpSum(player_vars[i] for i in self.df.index) == roster_size
 
-        # Safe Solver Invocation with Cloud Deadlock timeouts
-        prob.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=30))
-        
-        if pulp.LpStatus[prob.status] != 'Optimal':
-            break
-            
-        current_roster_indices = [i for i in players if roster_vars[i].varValue == 1]
-        previous_lineups.append(current_roster_indices)
-        
-        lineup_data = df.loc[current_roster_indices].copy()
-        lineup_data['Is_Captain'] = [captain_vars[i].varValue == 1 for i in current_roster_indices]
-        lineup_data['Lineup_Num'] = lineup_num
-        
-        all_lineups.append(lineup_data)
-        del prob # Memory cleanup
+        # 5. Constraint 2: Budget Cap
+        prob += pulp.lpSum(self.df.loc[i, 'Salary'] * player_vars[i] for i in self.df.index) <= budget
 
-    if all_lineups:
-        return pd.concat(all_lineups, ignore_index=True)
-    return pd.DataFrame()
+        # 6. Constraint 3: Max Players per Team (to prevent locking into just one country)
+        teams = self.df['Team'].unique()
+        for team in teams:
+            prob += pulp.lpSum(player_vars[i] for i in self.df.index if self.df.loc[i, 'Team'] == team) <= max_per_team
+
+        # 7. Solve the system quietly
+        prob.solve(pulp.PULP_CBC_CMD(msg=False))
+
+        # Check if an optimal solution was found
+        if pulp.LpStatus[prob.status] != "Optimal":
+            return None
+
+        # 8. Extract Selected Lineup
+        selected_indices = [i for i in self.df.index if player_vars[i].varValue == 1]
+        lineup_df = self.df.loc[selected_indices].copy()
+
+        # 9. Designate Captain (Highest projected player gets 1.5x multiplier)
+        lineup_df = lineup_df.sort_values(by="Projected_xPts", ascending=False).reset_index(drop=True)
+        lineup_df['Role'] = ['Captain (1.5x)'] + ['Flexible'] * (len(lineup_df) - 1)
+        
+        # Adjust captain's points in the final display array
+        lineup_df.loc[0, 'Projected_xPts'] = round(lineup_df.loc[0, 'Projected_xPts'] * 1.5, 2)
+
+        return lineup_df
