@@ -1,6 +1,6 @@
 import streamlit as st
 from single_game.data_pipeline import LiveDataPipeline
-from single_game.projections.py import ProjectionEngine  # Correct relative path reference
+from single_game.projections import ProjectionEngine  # Correct relative path reference
 
 def run_pipeline_orchestration():
     """

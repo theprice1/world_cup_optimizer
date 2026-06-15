@@ -37,7 +37,7 @@ else:
             
             if optimal_roster is not None:
                 # Display the team
-                st.dataframe(optimal_roster, use_container_width=True)
+                st.dataframe(optimal_roster, width="stretch")
                 
                 # Dynamic summary metrics calculations
                 total_cost = optimal_roster['Salary'].sum()

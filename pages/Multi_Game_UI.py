@@ -28,7 +28,7 @@ else:
             optimal_roster = optimizer.solve_slate(budget=budget_input, max_per_team=max_team_input)
             
             if optimal_roster is not None:
-                st.dataframe(optimal_roster, use_container_width=True)
+                st.dataframe(optimal_roster, width="stretch")
                 
                 total_cost = optimal_roster['Salary'].sum()
                 total_xpts = optimal_roster['Projected_xPts'].sum()

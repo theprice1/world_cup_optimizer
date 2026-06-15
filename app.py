@@ -15,7 +15,7 @@ if st.sidebar.button("Run Real-Time Data Pipeline"):
             player_pool_df = run_pipeline_orchestration()
             
             st.subheader("📊 Consolidated Player Pool Projection Output")
-            st.dataframe(player_pool_df.sort_values(by="Projected_xPts", ascending=False), use_container_width=True)
+            st.dataframe(player_pool_df.sort_values(by="Projected_xPts", ascending=False), width="stretch")
             
             # Informational status metrics
             total_players = len(player_pool_df)
