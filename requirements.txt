@@ -1,3 +1,7 @@
 streamlit
 pandas
+numpy
 pulp
+requests
+beautifulsoup4
+scipy

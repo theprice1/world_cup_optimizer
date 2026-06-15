@@ -1,35 +1,9 @@
 import pandas as pd
 import numpy as np
-import requests
 import math
+from scipy.stats import poisson, skellam
+from single_game.data_pipeline import LiveDataPipeline
 
-# ==========================================
-# PHASE 1: LIVE API ODDS INGESTION
-# ==========================================
-def fetch_live_market_odds(api_key, sport="soccer_fifa_world_cup", regions="eu"):
-    """
-    Dynamically pulls live moneyline and over/under odds from The-Odds-API.
-    Falls back to safe default tournament projections if the API limits are hit.
-    """
-    url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds/"
-    params = {
-        "apiKey": api_key,
-        "regions": regions,
-        "markets": "h2h,totals",
-        "oddsFormat": "decimal"
-    }
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code == 200:
-            return response.json()
-    except Exception:
-        pass
-    return None # Pipeline will handle None by reverting to default UI state safely
-
-
-# ==========================================
-# PHASE 2 & 3: HISTORICAL SHARES & BOTTLENECK ADJUSTMENTS
-# ==========================================
 def clean_position(pos_val):
     p = str(pos_val).upper().strip()
     if p in ['GK', 'GOALKEEPER', 'G']: return 'GK'
@@ -38,163 +12,162 @@ def clean_position(pos_val):
     if p in ['FWD', 'FW', 'FORWARD', 'ATTACKER', 'STRIKER', 'F']: return 'FWD'
     return p
 
-def compile_base_probabilities(df, match_odds):
+def solve_implied_poisson_sot(decimal_odds):
     """
-    Combines historical rolling player xG/xA per 90 with opponent 
-    positional defensive vulnerabilities.
+    MODEL 3: IMPLIED POISSON RATES FOR SHOTS ON TARGET
+    Solves for the implied Poisson rate (lambda) given standard market decimal odds.
+    If odds are invalid or missing, it gracefully provides a neutral default rate.
+    """
+    if pd.isna(decimal_odds) or decimal_odds <= 1.0:
+        return 0.85 # Balanced default expected shots on target value
+        
+    implied_prob = 1.0 / decimal_odds
+    
+    # Numerical solver to find lambda for the cumulative distribution function P(X >= 1)
+    # 1 - e^(-lambda) = implied_prob
+    # e^(-lambda) = 1 - implied_prob -> lambda = -ln(1 - implied_prob)
+    try:
+        val = max(0.01, min(0.99, implied_prob))
+        calculated_lambda = -math.log(1.0 - val)
+        return calculated_lambda
+    except Exception:
+        return 0.85
+
+def calculate_projections(df, match_odds, api_key=None):
+    """
+    Advanced Stochastic Projection Engine executing the 4 core models:
+    1. Survival Analysis (90-Minute Completion Bonus)
+    2. Poisson Thinning (Goalkeeper Save Volumes)
+    3. Implied Poisson Solving (Player-Specific Shots on Target Prop Lines)
+    4. Skellam Distributions (Dynamic In-Match Period Impact Points)
     """
     df = df.copy()
     df['Position'] = df['Position'].apply(clean_position)
+    df['Price'] = pd.to_numeric(df['Price'], errors='coerce').fillna(4.5)
     
-    # Use real historical statistics if present; otherwise fallback gracefully to scaled prices
-    if 'Hist_xG_per90' not in df.columns: df['Hist_xG_per90'] = pd.to_numeric(df['Price'], errors='coerce').fillna(4.5) * 0.02
-    if 'Hist_xA_per90' not in df.columns: df['Hist_xA_per90'] = pd.to_numeric(df['Price'], errors='coerce').fillna(4.5) * 0.015
-    if 'Hist_xMin' not in df.columns: df['Hist_xMin'] = 75.0
-
     team_col = 'Club' if 'Club' in df.columns else 'Team'
     df['Normalized_Team'] = df[team_col].astype(str).str.strip().str.upper()
 
-    # Opponent defensive bottleneck vectors (e.g., Team X concedes heavily down the flanks)
-    # Default = 1.0 (neutral). A value of 1.25 means the opponent allows 25% more production to that position.
-    opp_vulnerability = {
-        'QAT': {'DEF': 1.25, 'MID': 1.10, 'FWD': 1.05, 'GK': 1.0},
-        'SUI': {'DEF': 0.85, 'MID': 0.90, 'FWD': 0.80, 'GK': 0.95}
-    }
+    # Step 1: Ingest Pipeline Profiles
+    pipeline = LiveDataPipeline(odds_api_key=api_key)
+    fbref_history = pipeline.scrape_fbref_historical_baselines()
 
-    # Calculate squad-level aggregate historical expected stats to build market distribution weights
-    team_totals = df.groupby('Normalized_Team')[['Hist_xG_per90', 'Hist_xA_per90']].sum().to_dict('index')
+    # Step 2: Establish Position Group Price Pools for fallback distributions
+    group_salaries = df.groupby(['Normalized_Team', 'Position'])['Price'].sum().to_dict()
 
-    player_profiles = []
+    projected_data = []
 
     for index, row in df.iterrows():
+        name_upper = str(row['Name']).upper().strip()
         team = row['Normalized_Team']
         pos = row['Position']
-        
+        price = row['Price']
+
         if team not in match_odds:
+            row_dict = row.to_dict()
+            row_dict['xPts'] = 0.0
+            projected_data.append(row_dict)
             continue
-            
-        opp = [t for t in match_odds.keys() if t != team][0]
-        vuln_factor = opp_vulnerability.get(opp, {}).get(pos, 1.0)
-        
-        # Calculate raw team share weights based on historical baseline records
-        t_totals = team_totals.get(team, {'Hist_xG_per90': 1.0, 'Hist_xA_per90': 1.0})
-        xg_share = (row['Hist_xG_per90'] / max(0.01, t_totals['Hist_xG_per90'])) * vuln_factor
-        xa_share = (row['Hist_xA_per90'] / max(0.01, t_totals['Hist_xA_per90'])) * vuln_factor
-        
-        player_profiles.append({
-            'Name': row['Name'],
-            'Team': team,
-            'Position': pos,
-            'Price': row['Price'],
-            'xMin': float(row['Hist_xMin']),
-            'Base_xG_Share': xg_share,
-            'Base_xA_Share': xa_share
-        })
-        
-    return player_profiles
 
+        odds = match_odds[team]
+        opp_team = [t for t in match_odds.keys() if t != team][0]
+        opp_odds = match_odds[opp_team]
 
-# ==========================================
-# PHASE 4: MONTE CARLO SIMULATION ENGINE
-# ==========================================
-def run_monte_carlo_simulation(player_profiles, match_odds, simulations=10000, target_percentile=90):
-    """
-    Simulates the entire match script 10,000 times using paired Poisson distributions.
-    Extracts the elite 'ceiling' outcome profiles to build tournament winning lineups.
-    """
-    teams = list(match_odds.keys())
-    team_a, team_b = teams[0], teams[1]
-    
-    # Arrays to collect simulation outputs across all runs
-    sim_results = {p['Name']: np.zeros(simulations) for p in player_profiles}
-    
-    for sim in range(simulations):
-        # 1. Generate random true game script goal tallies via Poisson distributions
-        goals_a = np.random.poisson(match_odds[team_a]['xG'])
-        goals_b = np.random.poisson(match_odds[team_b]['xG'])
+        # Retrieve scraped metrics or construct smart fallbacks
+        player_stats = fbref_history.get(name_upper, {})
+        starts = player_stats.get('Starts', 10)
+        completions = player_stats.get('Complete_90', 7)
+        scraped_save_pct = player_stats.get('Save_Pct', 0.72 if pos == 'GK' else 0.0)
+
+        # ─── MODEL 1: SURVIVAL ANALYSIS (90-MINUTE COMPLETION BONUS) ───
+        # S(90) acts as the probability that a starter lasts the full game
+        survival_prob = completions / max(1, starts)
         
-        # Determine match state outcome
-        cs_a = (goals_b == 0)
-        cs_b = (goals_a == 0)
+        # Determine expected minutes based on historical survival curves
+        if pos == 'GK':
+            expected_mins = 90.0
+            survival_prob = 1.0
+        else:
+            expected_mins = 90.0 if survival_prob > 0.8 else (65.0 if survival_prob > 0.4 else 25.0)
+            
+        time_fraction = expected_mins / 90.0
+
+        # Calculate Appearance Base points
+        base_pts = 0.0
+        if expected_mins >= 60.0:
+            base_pts += 2.0
+            if pos in ['MID', 'FWD']:
+                base_pts += (1.0 * survival_prob) # FanTeam full 90-minute completion bonus value
+        elif expected_mins > 0.0:
+            base_pts += 1.0
+
+        # ─── MODEL 2: SKELLAM DISTRIBUTION (IMPACT POINTS) ───
+        # Goal differences follow a Skellam distribution when scaled over the player's active minutes
+        my_lambda = odds['xG'] * time_fraction
+        opp_lambda = opp_odds['xG'] * time_fraction
         
-        # 2. Iterate through players and score individual match events dynamically
-        for p in player_profiles:
-            pts = 0.0
-            xMin_factor = p['xMin'] / 90.0
-            
-            # Appearance allocation logic
-            if p['xMin'] >= 60: pts += 2.0
-            elif p['xMin'] > 0: pts += 1.0
-            else: continue
-            
-            # Team specific context matching
-            is_team_a = (p['Team'] == team_a)
-            my_team_goals = goals_a if is_team_a else goals_b
-            opp_team_goals = goals_b if is_team_a else goals_a
-            has_cs = cs_a if is_team_a else cs_b
-            
-            # Match outcome bonus vectors
-            if my_team_goals > opp_team_goals: pts += (0.3 * xMin_factor)
-            elif my_team_goals < opp_team_goals: pts -= (0.3 * xMin_factor)
-            
-            # Clean Sheet scoring maps
-            if has_cs and p['xMin'] >= 60:
-                if p['Position'] in ['GK', 'DEF']: pts += 4.0
-                elif p['Position'] == 'MID': pts += 1.0
-            elif p['Position'] in ['GK', 'DEF'] and p['xMin'] >= 60:
-                # Goal conceding penalties (-1 for every 2 goals conceded after the first)
-                if opp_team_goals >= 2:
-                    pts -= math.floor(opp_team_goals / 2)
-
-            # 3. Simulate Event Multipliers (Goals and Assists)
-            if my_team_goals > 0:
-                # Probability scaling factor for individual distribution assignments
-                sim_goals = np.random.binomial(my_team_goals, min(1.0, p['Base_xG_Share'] * xMin_factor))
-                sim_assists = np.random.binomial(max(0, my_team_goals - sim_goals), min(1.0, p['Base_xA_Share'] * xMin_factor))
-                
-                goal_value = {'FWD': 4, 'MID': 5, 'DEF': 6, 'GK': 10}.get(p['Position'], 4)
-                pts += (sim_goals * goal_value)
-                pts += (sim_assists * 3.0)
-                
-            # Peripheral volume projections (Shots on Target / Saves)
-            team_sot = match_odds[p['Team']]['Team_xSoT']
-            sim_sot = np.random.binomial(np.random.poisson(team_sot), min(0.3, 0.05 * xMin_factor))
-            sot_val = {'FWD': 0.4, 'MID': 0.4, 'DEF': 0.6}.get(p['Position'], 0.0)
-            pts += (sim_sot * sot_val)
-            
-            if p['Position'] == 'GK':
-                opp_sot = match_odds[team_b if is_team_a else team_a]['Team_xSoT']
-                sim_saves = max(0, np.random.poisson(opp_sot) - my_team_goals)
-                pts += (sim_saves * 0.5)
-
-            sim_results[p['Name']][sim] = max(0.0, pts)
-            
-    # 4. Collapse all 10,000 array iterations down into the specified percentile projection
-    compiled_projections = []
-    for p in player_profiles:
-        percentile_score = np.percentile(sim_results[p['Name']], target_percentile)
-        compiled_projections.append({
-            'Name': p['Name'],
-            'Team': p['Team'],
-            'Position': p['Position'],
-            'Price': p['Price'],
-            'xPts': round(percentile_score, 2)
-        })
+        prob_win_period = 1.0 - skellam.cdf(0, my_lambda, opp_lambda)
+        prob_loss_period = skellam.cdf(-1, my_lambda, opp_lambda)
         
-    return pd.DataFrame(compiled_projections).sort_values(by='xPts', ascending=False)
+        expected_impact_points = (prob_win_period * 0.3) - (prob_loss_period * 0.3)
+        base_pts += expected_impact_points
 
-# ==========================================
-# MASTER RUNTIME INTEGRATION ENTRY POINT
-# ==========================================
-def calculate_projections(df, match_odds):
-    """
-    Main pipeline handler mapping clean historical frameworks 
-    and feeding the Monte Carlo simulation logic.
-    """
-    # 1. Build and clean historical profiles
-    profiles = compile_base_probabilities(df, match_odds)
-    
-    # 2. Run simulation tracking elite 90th-percentile tournament upside floors
-    final_projections_df = run_monte_carlo_simulation(profiles, match_odds, simulations=10000, target_percentile=90)
-    
-    return final_projections_df
+        # ─── MODEL 3: GOALKEEPER SAVES (POISSON THINNING) ───
+        if pos == 'GK':
+            # Expected saves follow a thinned Poisson process driven by the opponent's total Shots on Target
+            expected_saves = scraped_save_pct * opp_odds['Team_xSoT']
+            base_pts += (expected_saves * 0.5) # FanTeam +0.5 points per save calculation
+
+        # ─── MODEL 4: PLAYER SHOTS ON TARGET (IMPLIED POISSON) ───
+        market_odds_col = 'Market_SoT_Odds' if 'Market_SoT_Odds' in df.columns else None
+        if market_odds_col and not pd.isna(row[market_odds_col]):
+            player_xSoT = solve_implied_poisson_sot(row[market_odds_col]) * time_fraction
+        else:
+            # Fallback allocation strategy using modified position price pools
+            total_pos_salary = group_salaries.get((team, pos), price)
+            price_weight = (price / total_pos_salary) if total_pos_salary > 0 else 1.0
+            pos_sot_share = {'FWD': 0.50, 'MID': 0.35, 'DEF': 0.15, 'GK': 0.0}.get(pos, 0.0)
+            player_xSoT = odds['Team_xSoT'] * pos_sot_share * price_weight * 2.0 * time_fraction
+
+        sot_scoring_multiplier = {'FWD': 0.4, 'MID': 0.4, 'DEF': 0.6}.get(pos, 0.0)
+        base_pts += (player_xSoT * sot_scoring_multiplier)
+
+        # ─── ATTACKING & DEFENSIVE BASELINES ───
+        # Clean Sheet modeling using Poisson distributions for goals conceded
+        opp_xG_poisson_rate = opp_odds['xG']
+        clean_sheet_prob = math.exp(-opp_xG_poisson_rate)
+        
+        if expected_mins >= 60.0:
+            if pos in ['GK', 'DEF']:
+                # Calculate defensive decay (penalties for multiple goals conceded)
+                prob_concede_2 = (opp_xG_poisson_rate**2 * math.exp(-opp_xG_poisson_rate)) / 2.0
+                prob_concede_3 = (opp_xG_poisson_rate**3 * math.exp(-opp_xG_poisson_rate)) / 6.0
+                base_pts += (clean_sheet_prob * 4.0) - (prob_concede_2 * 1.0) - (prob_concede_3 * 1.0)
+            elif pos == 'MID':
+                base_pts += (clean_sheet_prob * 1.0)
+
+        # Goals and Assists Distribution
+        total_pos_salary = group_salaries.get((team, pos), price)
+        price_weight = (price / total_pos_salary) if total_pos_salary > 0 else 1.0
+        pos_xg_share = {'FWD': 0.45, 'MID': 0.35, 'DEF': 0.18, 'GK': 0.02}.get(pos, 0.0)
+        
+        allocated_xG = odds['xG'] * pos_xg_share * price_weight * 2.0 * time_fraction
+        allocated_xA = allocated_xG * 0.75
+
+        goal_value = {'FWD': 4, 'MID': 5, 'DEF': 6, 'GK': 10}.get(pos, 4)
+        base_pts += (allocated_xG * goal_value)
+        base_pts += (allocated_xA * 3.0)
+
+        # Append calculated row to dataset
+        row_dict = row.to_dict()
+        row_dict['xPts'] = round(max(0.0, base_pts), 2)
+        projected_data.append(row_dict)
+
+    projected_df = pd.DataFrame(projected_data)
+    if 'Normalized_Team' in projected_df.columns:
+        projected_df = projected_df.drop(columns=['Normalized_Team'])
+        
+    if 'xPts' in projected_df.columns:
+        projected_df = projected_df.sort_values(by='xPts', ascending=False)
+        
+    return projected_df
