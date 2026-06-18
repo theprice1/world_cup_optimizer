@@ -18,24 +18,53 @@ class LiveDataPipeline:
         return " ".join(name.split())
 
     def fetch_player_props(self, sport="soccer_fifa_world_cup", regions="eu"):
-        """Fetches both SOT and Goalscorer markets to maximize data coverage."""
+        """Two-step fetch required by The Odds API for player props."""
         if not self.api_key:
             return None
             
-        url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds/"
-        params = {
+        # STEP 1: Query the main endpoint to get the specific Event IDs for active matches
+        events_url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds/"
+        events_params = {
             "apiKey": self.api_key,
             "regions": regions,
-            "markets": "player_shots_on_target,player_goal_scorer_anytime",
-            "oddsFormat": "decimal"
+            "markets": "h2h" # Lightweight query just to get the match list and IDs
         }
+        
         try:
-            response = requests.get(url, params=params, timeout=10)
-            if response.status_code == 200:
-                return response.json()
+            events_response = requests.get(events_url, params=events_params, timeout=10)
+            if events_response.status_code != 200:
+                return None
+            events_data = events_response.json()
         except Exception:
-            pass
-        return None
+            return None
+
+        all_props = []
+
+        # STEP 2: Loop through the Event IDs and query the Event-Specific endpoint
+        for event in events_data:
+            event_id = event.get('id')
+            if not event_id:
+                continue
+                
+            props_url = f"https://api.the-odds-api.com/v4/sports/{sport}/events/{event_id}/odds"
+            props_params = {
+                "apiKey": self.api_key,
+                "regions": regions,
+                "markets": "player_shots_on_target,player_goal_scorer_anytime",
+                "oddsFormat": "decimal"
+            }
+            
+            try:
+                # We increase timeout slightly as event endpoints can be heavier
+                props_response = requests.get(props_url, params=props_params, timeout=15)
+                if props_response.status_code == 200:
+                    event_props_data = props_response.json()
+                    all_props.append(event_props_data)
+            except Exception:
+                continue
+                
+        # Return the combined master list of all player props across all games
+        return all_props if len(all_props) > 0 else None
 
     def parse_shots_on_target_odds(self, json_data):
         if not json_data:
@@ -71,4 +100,4 @@ class LiveDataPipeline:
         return player_prop_map
 
     def scrape_fbref_historical_baselines(self):
-        return {} # Placeholder, logic remains the same
+        return {}
