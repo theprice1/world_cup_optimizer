@@ -5,54 +5,58 @@ class LineupOptimizer:
     def __init__(self):
         pass
 
-    def optimize(self, df, salary_cap=100.0, max_per_team=5, roster_status_filter="All", use_correlation=True):
+    def optimize(self, df, salary_cap=50.0, max_per_team=3, roster_status_filter="All", use_correlation=True):
         """
-        Executes linear programming optimization using PuLP.
-        Enforces exact roster construction rules, flexible budgets, 
-        and optional negative correlation.
+        Executes a 5-man Showdown linear programming optimization.
+        Allocates exactly 1 Captain (1.5x points) and 4 Flex players.
         """
-        # 1. PRE-OPTIMIZATION FILTERING
         pool_df = df.copy()
         
-        # Apply Starting/Expected filters if the column exists in the data
+        # Apply Status Filters
         if roster_status_filter != "All" and 'Status' in pool_df.columns:
             pool_df = pool_df[pool_df['Status'].str.contains(roster_status_filter, case=False, na=False)]
 
-        if pool_df.empty or len(pool_df) < 11:
-            return None, f"Insufficient players ({len(pool_df)}) available after applying the '{roster_status_filter}' filter to form an 11-man lineup."
+        if pool_df.empty or len(pool_df) < 5:
+            return None, f"Insufficient players ({len(pool_df)}) to form a 5-man lineup."
 
         pool_df = pool_df.reset_index(drop=True)
 
-        # 2. INITIALIZE LP PROBLEM
-        prob = pulp.LpProblem("FanTeam_Single_Game_Optimization", pulp.LpMaximize)
-        player_vars = pulp.LpVariable.dicts("Player", pool_df.index, cat="Binary")
+        # 1. INITIALIZE LP PROBLEM
+        prob = pulp.LpProblem("FanTeam_5_Man_Optimization", pulp.LpMaximize)
         
-        # Objective: Maximize total Projected xPts
-        prob += pulp.lpSum(pool_df.loc[i, "Projected_xPts"] * player_vars[i] for i in pool_df.index)
+        # We need TWO binary decision variables for every player
+        flex_vars = pulp.LpVariable.dicts("Flex", pool_df.index, cat="Binary")
+        capt_vars = pulp.LpVariable.dicts("Capt", pool_df.index, cat="Binary")
         
-        # 3. GLOBAL CONSTRAINTS
-        # Exact team size constraint
-        prob += pulp.lpSum(player_vars[i] for i in pool_df.index) == 11
+        # 2. OBJECTIVE: Maximize total xPts (Captain gets 1.5x points)
+        prob += pulp.lpSum(
+            (pool_df.loc[i, "Projected_xPts"] * flex_vars[i]) + 
+            (pool_df.loc[i, "Projected_xPts"] * 1.5 * capt_vars[i]) 
+            for i in pool_df.index
+        )
         
-        # Budget Limit Constraint
-        prob += pulp.lpSum(pool_df.loc[i, "Salary"] * player_vars[i] for i in pool_df.index) <= salary_cap
+        # 3. PLAYER MUTUALLY EXCLUSIVE RULE
+        # A player cannot be drafted as BOTH a Captain and a Flex
+        for i in pool_df.index:
+            prob += flex_vars[i] + capt_vars[i] <= 1
+            
+        # 4. ROSTER SIZE CONSTRAINTS
+        prob += pulp.lpSum(capt_vars[i] for i in pool_df.index) == 1  # Exactly 1 Captain
+        prob += pulp.lpSum(flex_vars[i] for i in pool_df.index) == 4  # Exactly 4 Flex
         
-        # 4. STRICT POSITIONAL ROSTER LIMITS
-        prob += pulp.lpSum(player_vars[i] for i in pool_df.index if pool_df.loc[i, "Position"] == "GK") == 1
-        prob += pulp.lpSum(player_vars[i] for i in pool_df.index if pool_df.loc[i, "Position"] == "DEF") >= 3
-        prob += pulp.lpSum(player_vars[i] for i in pool_df.index if pool_df.loc[i, "Position"] == "DEF") <= 5
-        prob += pulp.lpSum(player_vars[i] for i in pool_df.index if pool_df.loc[i, "Position"] == "MID") >= 3
-        prob += pulp.lpSum(player_vars[i] for i in pool_df.index if pool_df.loc[i, "Position"] == "MID") <= 5
-        prob += pulp.lpSum(player_vars[i] for i in pool_df.index if pool_df.loc[i, "Position"] == "FWD") >= 1
-        prob += pulp.lpSum(player_vars[i] for i in pool_df.index if pool_df.loc[i, "Position"] == "FWD") <= 3
+        # 5. BUDGET LIMIT
+        # Assuming Captain costs 1x salary. (If FanTeam charges 1.5x salary for Capt, multiply here)
+        prob += pulp.lpSum(pool_df.loc[i, "Salary"] * (flex_vars[i] + capt_vars[i]) for i in pool_df.index) <= salary_cap
+        
+        # 6. POSITIONAL LIMITS (Loose for 5-a-side)
+        prob += pulp.lpSum(flex_vars[i] + capt_vars[i] for i in pool_df.index if pool_df.loc[i, "Position"] == "GK") <= 1
 
-        # 5. DYNAMIC MAX PLAYERS PER CLUB
+        # 7. DYNAMIC MAX PLAYERS PER CLUB
         teams = pool_df["Team"].unique()
         for team in teams:
-            prob += pulp.lpSum(player_vars[i] for i in pool_df.index if pool_df.loc[i, "Team"] == team) <= max_per_team
+            prob += pulp.lpSum(flex_vars[i] + capt_vars[i] for i in pool_df.index if pool_df.loc[i, "Team"] == team) <= max_per_team
 
-        # 6. ANTI-CORRELATION ADVANCED RULE
-        # Blocks selecting an opposing forward if you roster that team's GK
+        # 8. ANTI-CORRELATION ADVANCED RULE
         if use_correlation and 'Opponent' in pool_df.columns:
             for i in pool_df.index:
                 if pool_df.loc[i, "Position"] == "GK":
@@ -60,20 +64,34 @@ class LineupOptimizer:
                     opposing_fwds = [j for j in pool_df.index if pool_df.loc[j, "Team"] == gk_opponent and pool_df.loc[j, "Position"] == "FWD"]
                     
                     for fwd_index in opposing_fwds:
-                        prob += player_vars[i] + player_vars[fwd_index] <= 1
+                        gk_drafted = flex_vars[i] + capt_vars[i]
+                        fwd_drafted = flex_vars[fwd_index] + capt_vars[fwd_index]
+                        prob += gk_drafted + fwd_drafted <= 1
 
-        # 7. RUN SOLVER
+        # 9. RUN SOLVER
         status = prob.solve(pulp.PULP_CBC_CMD(msg=False))
         
         if pulp.LpStatus[status] == "Optimal":
-            selected_indices = [i for i in pool_df.index if player_vars[i].varValue == 1]
-            optimized_df = pool_df.loc[selected_indices].copy()
+            selected_records = []
             
-            # Sort order structure for visual clean presentation in Streamlit UI
-            pos_order = {"GK": 0, "DEF": 1, "MID": 2, "FWD": 3}
-            optimized_df["_sort"] = optimized_df["Position"].map(pos_order)
+            for i in pool_df.index:
+                if capt_vars[i].varValue == 1:
+                    record = pool_df.loc[i].copy()
+                    record["Roster_Slot"] = "⭐ CAPTAIN"
+                    record["Projected_xPts"] = round(record["Projected_xPts"] * 1.5, 2)
+                    selected_records.append(record)
+                elif flex_vars[i].varValue == 1:
+                    record = pool_df.loc[i].copy()
+                    record["Roster_Slot"] = "FLEX"
+                    selected_records.append(record)
+                    
+            optimized_df = pd.DataFrame(selected_records)
+            
+            # Sort so the Captain is pinned to the top of your Streamlit UI
+            slot_order = {"⭐ CAPTAIN": 0, "FLEX": 1}
+            optimized_df["_sort"] = optimized_df["Roster_Slot"].map(slot_order)
             optimized_df = optimized_df.sort_values(["_sort", "Salary"], ascending=[True, False]).drop(columns=["_sort"])
             
-            return optimized_df, "Optimal Lineup Generated Successfully!"
+            return optimized_df, "Optimal 5-Man Lineup Generated Successfully!"
         
-        return None, "Infeasible Constraints: The solver could not form a legal squad under these settings. Try raising the budget or increasing maximum players per team."
+        return None, "Infeasible Constraints: The solver could not form a legal 5-man squad. Check budget or team limits."
