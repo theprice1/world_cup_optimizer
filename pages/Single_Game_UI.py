@@ -10,11 +10,11 @@ st.write("Generates optimal 5-a-side lineups with a 1.5x Captain multiplier.")
 # --- SIDEBAR DYNAMIC CONTROLS ---
 st.sidebar.header("Optimizer Settings")
 
-# 1. Adjustable Budget Slider
+# 1. Budget Slider tailored to Single Game settings
 budget = st.sidebar.slider("Salary Cap Budget", min_value=35.0, max_value=75.0, value=50.0, step=0.5)
 
-# 2. Maximum Players Allowed per Team Slider (Set to 5 to allow single-team stacks)
-max_players = st.sidebar.slider("Maximum Players per Club", min_value=1, max_value=5, value=4, step=1)
+# 2. Maximum Players Allowed per Team Slider (Up to 5 to allow complete single-team stacks)
+max_players = st.sidebar.slider("Maximum Players per Club", min_value=1, max_value=5, value=5, step=1)
 
 # 3. Match Status Filters
 status_mode = st.sidebar.radio("Player Availability Filter", ["All", "Expected", "Starting"])
@@ -26,7 +26,7 @@ anti_corr = st.sidebar.checkbox("Apply Goalkeeper Anti-Correlation", value=True)
 if "player_projections" in st.session_state and st.session_state["player_projections"] is not None:
     df_pool = st.session_state["player_projections"]
     
-    # Render the full projections table directly on the page
+    # Display the full projections table directly on the page
     st.subheader(f"📋 Full Player Projection Pool ({len(df_pool)} players loaded)")
     st.dataframe(
         df_pool.sort_values(by="Projected_xPts", ascending=False), 
