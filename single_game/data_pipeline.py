@@ -167,3 +167,42 @@ class LiveDataPipeline:
                                     player_prop_map[norm_name]['goal_odds'] = price
                                         
         return player_prop_map
+
+    def scrape_fbref_historical_baselines(self, target_club=None):
+        print("Loading player historical baselines...")
+        
+        # Structure the baseline template matching your ProjectionEngine expectations
+        baselines_template = {
+            'TEAMS': {
+                'USA': {'xG_per_game': 1.65, 'xGA_per_game': 1.10, 'CS_rate': 0.35},
+                'AUS': {'xG_per_game': 1.20, 'xGA_per_game': 1.45, 'CS_rate': 0.22}
+            },
+            'PLAYERS': {
+                # Mapped default archetypes if individual history is missing
+                'default_fwd': {'xG_per_90': 0.38, 'Assist_Share': 0.12, 'Cards_Per_90': 0.10, 'Expected_Minutes': 75.0},
+                'default_mid': {'xG_per_90': 0.14, 'Assist_Share': 0.22, 'Cards_Per_90': 0.18, 'Expected_Minutes': 80.0},
+                'default_def': {'xG_per_90': 0.04, 'Assist_Share': 0.08, 'Cards_Per_90': 0.22, 'Expected_Minutes': 90.0},
+                'default_gk': {'Save_Pct': 0.72, 'Cards_Per_90': 0.02, 'Expected_Minutes': 90.0}
+            }
+        }
+
+        try:
+            # Try loading from your local data folder if you previously saved scraped lines
+            df_history = pd.read_csv("single_game/data/fbref_historical.csv")
+            
+            # Convert CSV data rows into the lookup format
+            for _, row in df_history.iterrows():
+                p_name = row.get('Player')
+                if p_name:
+                    baselines_template['PLAYERS'][p_name] = {
+                        'xG_per_90': float(row.get('xG_no_pen_per_90', 0.15)),
+                        'Assist_Share': float(row.get('assists_per_90', 0.10)),
+                        'Cards_Per_90': float(row.get('cards_yellow_per_90', 0.15)) + float(row.get('cards_red_per_90', 0.01)),
+                        'Expected_Minutes': float(row.get('minutes', 80.0)),
+                        'Is_Penalty_Taker': bool(row.get('pens_made', 0) > 0)
+                    }
+            print("Successfully initialized baselines from local fbref_historical.csv storage.")
+        except FileNotFoundError:
+            print("Notice: fbref_historical.csv not found. Operating directly on target live-odds profile engines.")
+            
+        return baselines_template
