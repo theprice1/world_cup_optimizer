@@ -11,11 +11,37 @@ class ProjectionEngine:
 
     def build_projections_dataframe(self, fanteam_df, baselines=None, parsed_props=None):
         """
-        Builds a clean projection pool. Automatically steps in with robust 
-        positional allocation math if live bookmaker player props are None.
+        Builds a clean projection pool. Automatically handles messy CSV headers
+        and steps in with fallback math if live props are missing.
         """
         df = fanteam_df.copy()
         
+        # --- ROBUST COLUMN MAPPING ---
+        # Map common variations to what our engine expects: 'Player', 'Position', 'Team', 'Salary'
+        col_mapping = {}
+        for col in df.columns:
+            c_low = col.lower().strip()
+            if c_low in ['player', 'name', 'player name', 'player_name']:
+                col_mapping[col] = 'Player'
+            elif c_low in ['position', 'pos', 'role']:
+                col_mapping[col] = 'Position'
+            elif c_low in ['team', 'club', 'side']:
+                col_mapping[col] = 'Team'
+            elif c_low in ['salary', 'price', 'cost', 'credits']:
+                col_mapping[col] = 'Salary'
+                
+        df = df.rename(columns=col_mapping)
+        
+        # Ensure fallback defaults exist if columns are completely missing
+        if 'Player' not in df.columns:
+            raise KeyError(f"Could not find a Player/Name column. Found columns: {list(df.columns)}")
+        if 'Position' not in df.columns:
+            df['Position'] = 'MID' # Safe default
+        if 'Team' not in df.columns:
+            raise KeyError(f"Could not find a Team column. Found columns: {list(df.columns)}")
+        if 'Salary' not in df.columns:
+            df['Salary'] = 10.0 # Safe default fallback
+
         # Hardcoded team implied totals parsed from your data pool
         team_implied_goals = {"USA": 1.65, "AUS": 1.20}
         team_clean_sheet_prob = {"USA": 0.32, "AUS": 0.22} 
@@ -24,14 +50,21 @@ class ProjectionEngine:
 
         for idx, row in df.iterrows():
             player = row['Player']
-            pos = row['Position']
-            team = row['Team']
+            pos = str(row['Position']).upper().strip()
+            team = str(row['Team']).upper().strip()
             
-            # Get team context, default to a balanced baseline
-            imp_goals = team_implied_goals.get(team, 1.30)
-            cs_prob = team_clean_sheet_prob.get(team, 0.25)
+            # Normalize common position variations (e.g., Goalkeeper -> GK, Forward -> FWD)
+            if 'GK' in pos or 'GOAL' in pos: pos = 'GK'
+            elif 'DEF' in pos or 'BACK' in pos: pos = 'DEF'
+            elif 'MID' in pos or 'CENT' in pos: pos = 'MID'
+            elif 'FWD' in pos or 'STR' in pos or 'ATT' in pos: pos = 'FWD'
             
-            # Initialize empty baseline expectations
+            # Map clean team strings
+            clean_team = "USA" if "USA" in team or "UNITED STATES" in team else "AUS"
+            
+            imp_goals = team_implied_goals.get(clean_team, 1.30)
+            cs_prob = team_clean_sheet_prob.get(clean_team, 0.25)
+            
             exp_goals = 0.0
             exp_sot = 0.0
             
@@ -61,22 +94,16 @@ class ProjectionEngine:
 
             # 3. APPLY FANTEAM SCORING MATRIX
             xPts = self.appearance_points
-            
-            # Goal Scoring expected returns
             xPts += exp_goals * self.goal_weights.get(pos, 4.0)
-            
-            # Shots on target returns
             xPts += exp_sot * self.sot_points
-            
-            # Clean Sheet expected returns
             xPts += cs_prob * self.clean_sheet_weights.get(pos, 0.0)
             
-            # Goalkeeper Save Volume Estimates
             if pos == "GK":
-                opp_goals = team_implied_goals.get("AUS" if team == "USA" else "USA", 1.30)
+                opp_goals = team_implied_goals.get("AUS" if clean_team == "USA" else "USA", 1.30)
                 xPts += (opp_goals * 3.0) * 0.5
 
             projected_points.append(round(xPts, 2))
 
+        df["Position"] = [row['Position'] for idx, row in df.iterrows()] # Retain clean formatting
         df["Projected_xPts"] = projected_points
         return df
