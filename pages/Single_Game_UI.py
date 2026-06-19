@@ -11,7 +11,7 @@ st.write("Generate customized, mathematically optimized tournament lineups using
 st.sidebar.header("Optimizer Settings")
 
 # 1. Adjustable Budget Slider
-budget = st.sidebar.slider("Salary Cap Budget", min_value=70.0, max_value=120.0, value=100.0, step=0.5)
+budget = st.sidebar.slider("Salary Cap Budget", min_value=50.0, max_value=70.0, value=100.0, step=0.5)
 
 # 2. Maximum Players Allowed per Team Slider
 max_players = st.sidebar.slider("Maximum Players per Club", min_value=1, max_value=7, value=5, step=1)
