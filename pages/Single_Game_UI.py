@@ -14,7 +14,7 @@ st.sidebar.header("Optimizer Settings")
 budget = st.sidebar.slider("Salary Cap Budget", min_value=35.0, max_value=75.0, value=50.0, step=0.5)
 
 # 2. Maximum Players Allowed per Team Slider
-max_players = st.sidebar.slider("Maximum Players per Club", min_value=1, max_value=4, value=3, step=1)
+max_players = st.sidebar.slider("Maximum Players per Club", min_value=1, max_value=5, value=4, step=1)
 
 # 3. Match Status Filters
 status_mode = st.sidebar.radio("Player Availability Filter", ["All", "Expected", "Starting"])
