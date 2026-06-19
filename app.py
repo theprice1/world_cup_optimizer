@@ -12,7 +12,13 @@ st.write("Upload your FanTeam pricing CSV and fetch live Vegas odds to build the
 col1, col2 = st.columns(2)
 
 with col1:
-    api_key = st.text_input("The Odds API Key", type="password", help="Enter your live API key here.")
+    try:
+        # Silently load the key from .streamlit/secrets.toml
+        api_key = st.secrets["ODDS_API_KEY"]
+        st.success("🔐 API Key securely loaded from secrets!")
+    except FileNotFoundError:
+        # Fallback if the secrets file isn't set up yet
+        api_key = st.text_input("The Odds API Key", type="password", help="Enter your live API key here.")
     
 with col2:
     uploaded_file = st.file_uploader("Upload FanTeam Salary CSV", type=["csv"])
