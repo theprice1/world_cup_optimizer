@@ -9,9 +9,7 @@ class LiveDataPipeline:
         self.api_key = odds_api_key
 
     def normalize_name(self, name):
-        """Cleans accents, punctuation, and extra spaces for raw token matching."""
-        if not name or not isinstance(name, str):
-            return ""
+        if not name or not isinstance(name, str): return ""
         name = name.lower().strip()
         name = name.replace('.', ' ').replace('-', ' ')
         name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode('ascii')
@@ -19,39 +17,38 @@ class LiveDataPipeline:
         return " ".join(name.split())
 
     def fetch_player_props(self, sport="soccer_fifa_world_cup", regions="eu"):
-        """Two-step fetch required by The Odds API for player props and team baselines."""
         if not self.api_key:
+            print("CRITICAL: API Key is missing.")
             return None
             
-        # STEP 1: Query the main endpoint for team markets (h2h, totals, btts)
+        # STEP 1: Strict h2h and totals ONLY to avoid INVALID_MARKET 400 error
         events_url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds/"
         events_params = {
             "apiKey": self.api_key,
             "regions": regions,
-            "markets": "h2h,totals,btts",
+            "markets": "h2h,totals",
             "oddsFormat": "decimal"
         }
         
-        try:
-            events_response = requests.get(events_url, params=events_params, timeout=10)
-            if events_response.status_code != 200:
-                return None
-            events_data = events_response.json()
-        except Exception:
+        print(f"Fetching team match baselines...")
+        events_response = requests.get(events_url, params=events_params, timeout=10)
+        
+        # Stop swallowing errors. Let's see exactly what the API server says.
+        if events_response.status_code != 200:
+            print(f"ERROR Step 1: {events_response.status_code} - {events_response.text}")
             return None
-
-        # Build a team matrix lookup from Step 1 data
+            
+        events_data = events_response.json()
         team_market_map = self.parse_team_markets(events_data)
         all_props = []
 
-        # STEP 2: Loop through Event IDs to fetch player-specific props
+        print(f"Found {len(events_data)} matches. Fetching player props...")
+        # STEP 2: Player specific odds
         for event in events_data:
             event_id = event.get('id')
             home_team = event.get('home_team')
             away_team = event.get('away_team')
-            if not event_id:
-                continue
-                
+            
             props_url = f"https://api.the-odds-api.com/v4/sports/{sport}/events/{event_id}/odds"
             props_params = {
                 "apiKey": self.api_key,
@@ -60,69 +57,60 @@ class LiveDataPipeline:
                 "oddsFormat": "decimal"
             }
             
-            try:
-                props_response = requests.get(props_url, params=props_params, timeout=15)
-                if props_response.status_code == 200:
-                    event_props_data = props_response.json()
-                    
-                    # Inject calculated team-level data into the event props object
-                    event_props_data['team_metrics'] = {
-                        'home_team': home_team,
-                        'away_team': away_team,
-                        'home_metrics': team_market_map.get(home_team, {}),
-                        'away_metrics': team_market_map.get(away_team, {})}
-                    
-                    all_props.append(event_props_data)
-            except Exception:
-                continue
+            props_response = requests.get(props_url, params=props_params, timeout=15)
+            if props_response.status_code == 200:
+                event_props_data = props_response.json()
+                event_props_data['team_metrics'] = {
+                    'home_team': home_team,
+                    'away_team': away_team,
+                    'home_metrics': team_market_map.get(home_team, {}),
+                    'away_metrics': team_market_map.get(away_team, {})
+                }
+                all_props.append(event_props_data)
+            else:
+                print(f"Failed to fetch props for {home_team} vs {away_team}: {props_response.status_code}")
                 
         return all_props if len(all_props) > 0 else None
 
     def parse_team_markets(self, events_data):
-        """Calculates expected goals (xG) and clean sheet probabilities for each team."""
         team_map = {}
         for event in events_data:
             home = event.get('home_team')
             away = event.get('away_team')
             
-            # Default fallbacks
             total_goals_line = 2.5
             prob_over = 0.50
-            prob_btts_yes = 0.55
+            prob_home_win = 0.33
+            prob_away_win = 0.33
             
-            # Extract markets from the primary bookmaker (usually the first one returned)
             bookmakers = event.get('bookmakers', [])
-            if not bookmakers:
-                continue
-            
-            markets = bookmakers[0].get('markets', [])
-            for market in markets:
-                if market['key'] == 'totals':
-                    outcome = market['outcomes'][0]
-                    total_goals_line = outcome.get('point', 2.5)
-                    price = outcome.get('price', 2.0)
-                    if outcome.get('name') == 'Over':
-                        prob_over = 1.0 / price
-                    else:
-                        prob_over = 1.0 - (1.0 / price)
-                elif market['key'] == 'btts':
-                    for outcome in market['outcomes']:
-                        if outcome['name'] == 'Yes':
-                            prob_btts_yes = 1.0 / outcome['price']
+            if bookmakers:
+                markets = bookmakers[0].get('markets', [])
+                for market in markets:
+                    if market['key'] == 'totals':
+                        outcome = market['outcomes'][0]
+                        total_goals_line = outcome.get('point', 2.5)
+                        price = outcome.get('price', 2.0)
+                        prob_over = 1.0 / price if outcome.get('name') == 'Over' else 1.0 - (1.0 / price)
+                    elif market['key'] == 'h2h':
+                        for outcome in market['outcomes']:
+                            if outcome['name'] == home:
+                                prob_home_win = 1.0 / outcome['price']
+                            elif outcome['name'] == away:
+                                prob_away_win = 1.0 / outcome['price']
 
-            # --- Implied Total Goals Calculation (Using basic Gallagher/Poisson relation) ---
-            # Approximating expected total game goals based on the 2.5 line projection
             implied_total_game_goals = total_goals_line * (prob_over / 0.5) * 0.95
+            total_win_prob = prob_home_win + prob_away_win
             
-            # Clean sheet approximation derived via Both Teams To Score (BTTS) probability
-            # P(Clean Sheet) is highly correlated with 1 - P(BTTS) weighted by match favoritism
-            prob_home_cs = max(0.05, 1.0 - prob_btts_yes) * 1.1
-            prob_away_cs = max(0.05, 1.0 - prob_btts_yes) * 0.85
-            
-            # Allocate total match goals to individual teams
-            # Normalizing to avoid split extremes
-            home_xG = implied_total_game_goals * 0.55
-            away_xG = implied_total_game_goals * 0.45
+            home_share = prob_home_win / total_win_prob if total_win_prob > 0 else 0.5
+            away_share = prob_away_win / total_win_prob if total_win_prob > 0 else 0.5
+
+            home_xG = implied_total_game_goals * home_share
+            away_xG = implied_total_game_goals * away_share
+
+            # Exact Poisson process model for Clean Sheets
+            prob_home_cs = math.exp(-away_xG)
+            prob_away_cs = math.exp(-home_xG)
 
             team_map[home] = {
                 'expected_goals_for': round(home_xG, 2),
@@ -137,12 +125,10 @@ class LiveDataPipeline:
         return team_map
 
     def parse_shots_on_target_odds(self, json_data):
-        if not json_data:
-            return {}
+        if not json_data: return {}
 
         player_prop_map = {}
         for event in json_data:
-            # Extract team metrics metadata injected during the fetch phase
             metrics_meta = event.get('team_metrics', {})
             home_team = metrics_meta.get('home_team')
             away_team = metrics_meta.get('away_team')
@@ -157,35 +143,27 @@ class LiveDataPipeline:
                             outcome_name = outcome.get('name')
                             price = outcome.get('price')
                             
-                            if not player_name:
-                                continue
-                                
+                            if not player_name: continue
                             norm_name = self.normalize_name(player_name)
                             
-                            # Tie the player back to their specific team context
-                            # The Odds API properties don't explicitly list player team inside outcomes, 
-                            # so we initialize with a default blank template to be resolved during string match
                             if norm_name not in player_prop_map:
                                 player_prop_map[norm_name] = {
-                                    'sot_over_odds': None, 
-                                    'sot_line': 1.5, 
-                                    'goal_odds': None,
-                                    'home_team': home_team,
-                                    'away_team': away_team,
-                                    'home_metrics': home_stats,
-                                    'away_metrics': away_stats
+                                    'sot_over_odds': None, 'sot_line': 0.5, 'goal_odds': None,
+                                    'home_team': home_team, 'away_team': away_team,
+                                    'home_metrics': home_stats, 'away_metrics': away_stats
                                 }
                             
-                            if market['key'] == 'player_shots_on_target' and "Over" in outcome_name:
-                                line_match = re.search(r'\d+\.\d+|\d+', outcome_name)
-                                line_val = float(line_match.group()) if line_match else 0.5
-                                player_prop_map[norm_name]['sot_over_odds'] = price
-                                player_prop_map[norm_name]['sot_line'] = line_val
+                            # Standardize mapping to the Over 0.5 line for mathematical consistency
+                            if market['key'] == 'player_shots_on_target' and outcome_name == 'Over':
+                                point_line = outcome.get('point', 0.5)
+                                if point_line == 0.5 or player_prop_map[norm_name]['sot_over_odds'] is None:
+                                    player_prop_map[norm_name]['sot_over_odds'] = price
+                                    player_prop_map[norm_name]['sot_line'] = point_line
                                 
-                            elif market['key'] == 'player_goal_scorer_anytime':
-                                player_prop_map[norm_name]['goal_odds'] = price
+                            elif market['key'] == 'player_goal_scorer_anytime' and outcome_name == 'Yes':
+                                # Map the lowest price (highest probability) to avoid stragglers
+                                current_odds = player_prop_map[norm_name]['goal_odds']
+                                if current_odds is None or price < current_odds:
+                                    player_prop_map[norm_name]['goal_odds'] = price
                                         
         return player_prop_map
-
-    def scrape_fbref_historical_baselines(self):
-        return {}
