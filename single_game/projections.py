@@ -193,7 +193,7 @@ class ProjectionEngine:
                 'SOT_Odds': sot_odds,
                 'Team_xG': round(team_xG, 2),
                 'Team_xGA': round(team_xGA, 2),
-                'xPts': round(xPts, 2)
+                'Projected_xPts': round(xPts, 2)
             })
             
         return pd.DataFrame(rows)
