@@ -1,96 +1,82 @@
-import pulp
 import pandas as pd
+import numpy as np
 
-class LineupOptimizer:
+class ProjectionEngine:
     def __init__(self):
-        pass
+        # FanTeam Single-Game Point Scoring Rules
+        self.appearance_points = 2.0
+        self.sot_points = 0.6
+        self.goal_weights = {"GK": 8.0, "DEF": 6.0, "MID": 5.0, "FWD": 4.0}
+        self.clean_sheet_weights = {"GK": 4.0, "DEF": 4.0, "MID": 1.0, "FWD": 0.0}
 
-    def optimize(self, df, salary_cap=50.0, max_per_team=5, roster_status_filter="All", use_correlation=True):
+    def build_projections_dataframe(self, fanteam_df, baselines=None, parsed_props=None):
         """
-        Executes a 5-man Showdown linear programming optimization.
-        Allocates exactly 1 Captain (1.5x points) and 4 Flex players.
+        Builds a clean projection pool. Automatically steps in with robust 
+        positional allocation math if live bookmaker player props are None.
         """
-        pool_df = df.copy()
+        df = fanteam_df.copy()
         
-        # Apply Status Filters if column exists
-        if roster_status_filter != "All" and 'Status' in pool_df.columns:
-            pool_df = pool_df[pool_df['Status'].str.contains(roster_status_filter, case=False, na=False)]
+        # Hardcoded team implied totals parsed from your data pool
+        team_implied_goals = {"USA": 1.65, "AUS": 1.20}
+        team_clean_sheet_prob = {"USA": 0.32, "AUS": 0.22} 
 
-        if pool_df.empty or len(pool_df) < 5:
-            return None, f"Insufficient players ({len(pool_df)}) to form a 5-man lineup."
+        projected_points = []
 
-        pool_df = pool_df.reset_index(drop=True)
-
-        # 1. INITIALIZE LP PROBLEM
-        prob = pulp.LpProblem("FanTeam_5_Man_Optimization", pulp.LpMaximize)
-        
-        # Two binary decision variables per player: chosen as Flex or chosen as Captain
-        flex_vars = pulp.LpVariable.dicts("Flex", pool_df.index, cat="Binary")
-        capt_vars = pulp.LpVariable.dicts("Capt", pool_df.index, cat="Binary")
-        
-        # 2. OBJECTIVE: Maximize total xPts (Captain gets 1.5x points)
-        prob += pulp.lpSum(
-            (pool_df.loc[i, "Projected_xPts"] * flex_vars[i]) + 
-            (pool_df.loc[i, "Projected_xPts"] * 1.5 * capt_vars[i]) 
-            for i in pool_df.index
-        )
-        
-        # 3. PLAYER MUTUALLY EXCLUSIVE RULE
-        # A player cannot be both Captain and Flex simultaneously
-        for i in pool_df.index:
-            prob += flex_vars[i] + capt_vars[i] <= 1
+        for idx, row in df.iterrows():
+            player = row['Player']
+            pos = row['Position']
+            team = row['Team']
             
-        # 4. ROSTER SIZE CONSTRAINTS
-        prob += pulp.lpSum(capt_vars[i] for i in pool_df.index) == 1  # Exactly 1 Captain
-        prob += pulp.lpSum(flex_vars[i] for i in pool_df.index) == 4  # Exactly 4 Flex
-        
-        # 5. BUDGET LIMIT (Captain costs 1x normal salary)
-        prob += pulp.lpSum(pool_df.loc[i, "Salary"] * (flex_vars[i] + capt_vars[i]) for i in pool_df.index) <= salary_cap
-        
-        # 6. POSITIONAL LIMITS
-        prob += pulp.lpSum(flex_vars[i] + capt_vars[i] for i in pool_df.index if pool_df.loc[i, "Position"] == "GK") <= 1
-
-        # 7. DYNAMIC MAX PLAYERS PER CLUB
-        teams = pool_df["Team"].unique()
-        for team in teams:
-            prob += pulp.lpSum(flex_vars[i] + capt_vars[i] for i in pool_df.index if pool_df.loc[i, "Team"] == team) <= max_per_team
-
-        # 8. ANTI-CORRELATION RULE
-        if use_correlation and 'Opponent' in pool_df.columns:
-            for i in pool_df.index:
-                if pool_df.loc[i, "Position"] == "GK":
-                    gk_opponent = pool_df.loc[i, "Opponent"]
-                    opposing_fwds = [j for j in pool_df.index if pool_df.loc[j, "Team"] == gk_opponent and pool_df.loc[j, "Position"] == "FWD"]
-                    
-                    for fwd_index in opposing_fwds:
-                        gk_drafted = flex_vars[i] + capt_vars[i]
-                        fwd_drafted = flex_vars[fwd_index] + capt_vars[fwd_index]
-                        prob += gk_drafted + fwd_drafted <= 1
-
-        # 9. RUN SOLVER
-        status = prob.solve(pulp.PULP_CBC_CMD(msg=False))
-        
-        if pulp.LpStatus[status] == "Optimal":
-            selected_records = []
+            # Get team context, default to a balanced baseline
+            imp_goals = team_implied_goals.get(team, 1.30)
+            cs_prob = team_clean_sheet_prob.get(team, 0.25)
             
-            for i in pool_df.index:
-                if capt_vars[i].varValue == 1:
-                    record = pool_df.loc[i].copy()
-                    record["Roster_Slot"] = "⭐ CAPTAIN"
-                    record["Projected_xPts"] = round(record["Projected_xPts"] * 1.5, 2)
-                    selected_records.append(record)
-                elif flex_vars[i].varValue == 1:
-                    record = pool_df.loc[i].copy()
-                    record["Roster_Slot"] = "FLEX"
-                    selected_records.append(record)
-                    
-            optimized_df = pd.DataFrame(selected_records)
+            # Initialize empty baseline expectations
+            exp_goals = 0.0
+            exp_sot = 0.0
             
-            # Put Captain at the top of the interface
-            slot_order = {"⭐ CAPTAIN": 0, "FLEX": 1}
-            optimized_df["_sort"] = optimized_df["Roster_Slot"].map(slot_order)
-            optimized_df = optimized_df.sort_values(["_sort", "Salary"], ascending=[True, False]).drop(columns=["_sort"])
+            # 1. ATTEMPT LIVE API COUPLING
+            has_live_props = False
+            if parsed_props and player in parsed_props:
+                props = parsed_props[player]
+                if props.get('anytime_goal_prob') is not None:
+                    exp_goals = props['anytime_goal_prob']
+                    exp_sot = props.get('expected_sot', 0.0)
+                    has_live_props = True
+
+            # 2. EMERGENCY FALLBACK MATH
+            if not has_live_props:
+                if pos == "FWD":
+                    exp_goals = imp_goals * 0.38  
+                    exp_sot = 1.6 * (imp_goals / 1.3)
+                elif pos == "MID":
+                    exp_goals = imp_goals * 0.18
+                    exp_sot = 0.9 * (imp_goals / 1.3)
+                elif pos == "DEF":
+                    exp_goals = imp_goals * 0.06
+                    exp_sot = 0.3
+                elif pos == "GK":
+                    exp_goals = 0.0
+                    exp_sot = 0.0
+
+            # 3. APPLY FANTEAM SCORING MATRIX
+            xPts = self.appearance_points
             
-            return optimized_df, "Optimal 5-Man Lineup Generated Successfully!"
-        
-        return None, "Infeasible Constraints: The solver could not form a legal 5-man squad. Try raising the budget or increasing maximum players per team."
+            # Goal Scoring expected returns
+            xPts += exp_goals * self.goal_weights.get(pos, 4.0)
+            
+            # Shots on target returns
+            xPts += exp_sot * self.sot_points
+            
+            # Clean Sheet expected returns
+            xPts += cs_prob * self.clean_sheet_weights.get(pos, 0.0)
+            
+            # Goalkeeper Save Volume Estimates
+            if pos == "GK":
+                opp_goals = team_implied_goals.get("AUS" if team == "USA" else "USA", 1.30)
+                xPts += (opp_goals * 3.0) * 0.5
+
+            projected_points.append(round(xPts, 2))
+
+        df["Projected_xPts"] = projected_points
+        return df
